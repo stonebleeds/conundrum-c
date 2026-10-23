@@ -13,9 +13,9 @@ Produce **identical output** to the original Python version for the same command
 
 - Reads binary data from stdin and writes results to stdout
 - Supports a variable number of 256-position wheels plus a 16-bit “big wheel”
-- All diagnostic and progress messages go to stderr
-- Safety check that aborts if the wheel positions fully cycle back to the starting state
-- Human-readable byte counts in status messages
+- All diagnostic and progress messages go to stderr (starting in v0.03adt)
+- Safety check that aborts if the wheel positions fully cycle back to the starting state (starting in v0.03adt)
+- Human-readable byte counts in status messages (starting in v0.03adt)
 - Single-threaded, readable, and portable C (works on macOS, Linux, and Windows)
 
 ## Building
