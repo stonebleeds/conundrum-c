@@ -20,10 +20,10 @@ Produce **identical output** to the original Python version for the same command
 
 ## Building
 
-You will need the wheel and big-wheel tables (normally provided in `precon.c` / `precon.h`).
+Put both precon.h and conundrum.c in the same directory, go to that directory, then do this:
 
 ```bash
-clang -O2 -o conundrum-c conundrum.c precon.c# conundrum-c
+clang -O2 -o conundrum-c conundrum.c
 
 ```
 
