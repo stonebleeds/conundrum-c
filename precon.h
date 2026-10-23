@@ -1,7 +1,7 @@
 #ifndef PRECON_H
 #define PRECON_H
 
-#define PRECONVER "0.03ac"
+#define PRECONVER "0.03adt"
 
 /* 256 wheels, each with 256 positions */
 extern const unsigned char WHEELS[256][256] = {

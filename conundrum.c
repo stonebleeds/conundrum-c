@@ -1,10 +1,9 @@
 /*
  * conundrum-c
- * A C port of the original conundrum (Python 2.7) by Matthew K. Jensen.
- * Goal: identical output for the same command-line arguments and input data,
- * while being faster and more portable.
+ * C port of conundrum v0.03adt by Matthew K. Jensen
+ * Goal: identical stdout output, much higher speed
  *
- * License: GPL-2.0-only (same as the original)
+ * License: GPL-2.0-only
  */
 
 #include <stdio.h>
@@ -19,21 +18,40 @@
   #define sleep_seconds(s) Sleep((DWORD)(s) * 1000)
 #else
   #include <unistd.h>
-  #define sleep_seconds(s) sleep(s)
+  #define sleep_seconds(s) sleep((unsigned int)(s))
 #endif
 
 #include "precon.h"
 
-/* Extremely obvious flush interval – friendly size on modern platforms */
+/* Extremely obvious flush interval */
 #define FLUSH_EVERY_BYTES 4096
 
-#define VERSION "0.03ac-c"
+#define VERSION           "0.03adt-c"
 #define MAX_SLEEP_ATTEMPTS 5
 #define SPOTCHECK_INTERVAL_SEC 60
 
-/* ---------- diagnostics helpers ---------- */
+/* ---------- human-readable size (equivalent of precon.convert_size) ---------- */
 
-static void diag_timestamp(void)
+static void print_human_size(unsigned long long bytes)
+{
+    static const char *units[] = {"B", "KB", "MB", "GB", "TB", "PB"};
+    int unit = 0;
+    double size = (double)bytes;
+
+    while (size >= 1024.0 && unit < 5) {
+        size /= 1024.0;
+        unit++;
+    }
+
+    if (unit == 0)
+        fprintf(stderr, "%llu %s", bytes, units[unit]);
+    else
+        fprintf(stderr, "%.2f %s", size, units[unit]);
+}
+
+/* ---------- helpers ---------- */
+
+static void diag_time(void)
 {
     time_t now = time(NULL);
     char buf[64];
@@ -44,18 +62,9 @@ static void diag_timestamp(void)
     }
 }
 
-static void diag(const char *msg)
-{
-    diag_timestamp();
-    fprintf(stderr, "%s\n", msg);
-}
-
-/* ---------- argument parsing ---------- */
-
 static int parse_hex16(const char *s, unsigned int *out)
 {
-    /* Expects strings that start with "0x" or "0X" followed by 1–4 hex digits */
-    if (!s || (s[0] != '0') || (s[1] != 'x' && s[1] != 'X'))
+    if (!s || s[0] != '0' || (s[1] != 'x' && s[1] != 'X'))
         return 0;
 
     s += 2;
@@ -64,10 +73,11 @@ static int parse_hex16(const char *s, unsigned int *out)
 
     unsigned int val = 0;
     int digits = 0;
+
     while (*s) {
         char c = *s++;
         if (digits >= 4)
-            return 0;
+            return 0;               /* more than 4 hex digits → reject */
         if (c >= '0' && c <= '9')
             val = (val << 4) | (c - '0');
         else if (c >= 'a' && c <= 'f')
@@ -78,6 +88,7 @@ static int parse_hex16(const char *s, unsigned int *out)
             return 0;
         digits++;
     }
+
     *out = val;
     return 1;
 }
@@ -86,64 +97,71 @@ static int parse_hex16(const char *s, unsigned int *out)
 
 int main(int argc, char *argv[])
 {
-    int i;
+    time_t start_time = time(NULL);
+    time_t last_spotcheck = start_time;
     unsigned long long outcount = 0;
     int any_data = 0;
-    time_t start_time, last_spotcheck;
-    unsigned int bigwheelpos;
-    int num_wheels;
-    unsigned char *positions = NULL;   /* current position of each wheel */
-    const unsigned char **cassette = NULL; /* pointers into WHEELS */
     size_t flush_counter = 0;
 
-    start_time = time(NULL);
-    last_spotcheck = start_time;
+    unsigned int bigwheelpos;
+    int num_wheels;
+    unsigned char *positions = NULL;
+    unsigned char *original_positions = NULL;
+    const unsigned char **cassette = NULL;
 
-    fprintf(stderr, "Started conundrum-c %s with precon version %s and options:\n",
+    int i, w;
+    int c;
+
+    /* ---- startup banner ---- */
+    fprintf(stderr, "#### Started conundrum-c %s with precon version %s and options:\n",
             VERSION, PRECONVER);
     for (i = 0; i < argc; i++)
         fprintf(stderr, "%s ", argv[i]);
+    fprintf(stderr, "\nat ");
+    diag_time();
     fprintf(stderr, "\n");
-    diag("Startup diagnostics begin");
 
-    /* ----- validate argument count ----- */
+    /* ---- argument count ---- */
     if (argc < 3) {
-        diag("Too few arguments. Need at least one wheel setting and the big-wheel position.");
+        fprintf(stderr, "Too few arguments. Need at least one wheel setting and the big-wheel position.\n");
         fprintf(stderr, "Usage: %s <wheelpos> [wheelpos ...] <bigwheelpos>\n", argv[0]);
-        fprintf(stderr, "Each argument must be a 16-bit hex value starting with 0x\n");
         return 1;
     }
 
-    num_wheels = argc - 2;   /* everything except program name and final big-wheel */
+    num_wheels = argc - 2;
 
-    /* ----- parse big-wheel position (last argument) ----- */
+    /* ---- parse big-wheel (last argument) ---- */
     if (!parse_hex16(argv[argc - 1], &bigwheelpos)) {
         fprintf(stderr, "Invalid big-wheel position: \"%s\"\n", argv[argc - 1]);
-        diag("Aborting because of invalid big-wheel argument");
         return 1;
     }
     bigwheelpos &= 0xFFFF;
 
     fprintf(stderr, "bigwheelpos appears to be 0x%04x\n", bigwheelpos);
     fprintf(stderr, "cassette length is figured to be %d / 0x%x\n", num_wheels, num_wheels);
+    fprintf(stderr, "#### Processing settings\n");
 
-    /* ----- allocate and parse wheels ----- */
-    cassette  = malloc((size_t)num_wheels * sizeof(*cassette));
-    positions = malloc((size_t)num_wheels * sizeof(*positions));
-    if (!cassette || !positions) {
-        diag("Memory allocation failed for cassette/positions");
+    /* ---- allocate ---- */
+    cassette           = malloc((size_t)num_wheels * sizeof(*cassette));
+    positions          = malloc((size_t)num_wheels * sizeof(*positions));
+    original_positions = malloc((size_t)num_wheels * sizeof(*original_positions));
+
+    if (!cassette || !positions || !original_positions) {
+        fprintf(stderr, "Memory allocation failed\n");
         free(cassette);
         free(positions);
+        free(original_positions);
         return 1;
     }
 
+    /* ---- parse wheels ---- */
     for (i = 0; i < num_wheels; i++) {
         unsigned int setting;
         if (!parse_hex16(argv[i + 1], &setting)) {
             fprintf(stderr, "Invalid wheel setting: \"%s\"\n", argv[i + 1]);
-            diag("Aborting because of invalid wheel argument");
             free(cassette);
             free(positions);
+            free(original_positions);
             return 1;
         }
 
@@ -155,48 +173,54 @@ int main(int argc, char *argv[])
 
         cassette[i]  = WHEELS[wheel_id];
         positions[i] = (unsigned char)pos;
+        original_positions[i] = positions[i];
     }
 
-    diag("Moving on...");
-    diag("starting intake loops");
+    fprintf(stderr, "Moving on...\n");
+    fprintf(stderr, "#### Attempting to read from stdin at ");
+    diag_time();
+    fprintf(stderr, "\n");
 
-    /* ----- first-byte special handling (short sleeps only once) ----- */
-    int c = fgetc(stdin);
+    /* ---- first-byte delay handling ---- */
+    c = fgetc(stdin);
     if (c == EOF) {
         int attempt;
         for (attempt = 1; attempt <= MAX_SLEEP_ATTEMPTS; attempt++) {
-            fprintf(stderr, "nextbyte empty before processing loops. Sleep interval currently at %d.\n",
-                    attempt);
+            fprintf(stderr, "### nextbyte empty before processing loops at ");
+            diag_time();
+            fprintf(stderr, "\nSleep interval currently at %d.\n", attempt);
             sleep_seconds(attempt);
             c = fgetc(stdin);
             if (c != EOF)
                 break;
         }
         if (c == EOF) {
-            diag("Never got incoming bytes and hit interval limit.");
+            fprintf(stderr, "Never got incoming bytes and hit interval limit.\n");
             free(cassette);
             free(positions);
+            free(original_positions);
             return 1;
         }
     }
 
-    /* ----- main processing loop ----- */
+    fprintf(stderr, "#### Starting intake loops at ");
+    diag_time();
+    fprintf(stderr, "\n");
+
+    /* ---- main processing loop ---- */
     while (c != EOF) {
         unsigned char xr = 0;
-        int w;
 
-        /* XOR with every wheel at its current position */
         for (w = 0; w < num_wheels; w++)
             xr ^= cassette[w][positions[w]];
 
-        /* XOR with big wheel */
         xr ^= BW[bigwheelpos];
 
-        /* output the result */
         if (fputc(c ^ xr, stdout) == EOF) {
-            diag("Error writing to stdout");
+            fprintf(stderr, "Error writing to stdout\n");
             free(cassette);
             free(positions);
+            free(original_positions);
             return 1;
         }
 
@@ -206,33 +230,66 @@ int main(int argc, char *argv[])
 
         if (flush_counter >= FLUSH_EVERY_BYTES) {
             if (fflush(stdout) != 0) {
-                diag("Error flushing stdout");
+                fprintf(stderr, "Error flushing stdout\n");
                 free(cassette);
                 free(positions);
+                free(original_positions);
                 return 1;
             }
             flush_counter = 0;
         }
 
-        /* advance wheel positions (last wheel is least-significant) */
+        /* advance positions (last wheel = least significant) */
         for (w = num_wheels - 1; w >= 0; w--) {
             positions[w]++;
-            if (positions[w] != 0)   /* no carry */
+            if (positions[w] != 0)
                 break;
         }
 
-        /* advance big wheel */
+        /* safety check: have we rolled all the way back? */
+        if (outcount > 1 &&
+            memcmp(positions, original_positions, (size_t)num_wheels) == 0) {
+
+            fprintf(stderr,
+                "################################################################################\n"
+                "#                                                                              #\n"
+                "#                                  WARNING!!!                                  #\n"
+                "#                                                                              #\n"
+                "# The wheel positions have rolled back to original values. The data is         #\n"
+                "# therefore insecure. Conundrum must stop.                                     #\n"
+                "#                                                                              #\n"
+                "################################################################################\n\n");
+
+            fprintf(stderr, "Time running before break: %.0f seconds.\n",
+                    difftime(time(NULL), start_time));
+            fprintf(stderr, "Total bytes: %llu bytes / ", outcount);
+            print_human_size(outcount);
+            fprintf(stderr, " before break. Godspeed.\n");
+            fprintf(stderr, "Break at ");
+            diag_time();
+            fprintf(stderr, "\n");
+
+            free(cassette);
+            free(positions);
+            free(original_positions);
+            return 1;
+        }
+
         bigwheelpos = (bigwheelpos + 1) & 0xFFFF;
 
-        /* spot-check roughly every minute */
+        /* spot check roughly every minute */
         {
             time_t now = time(NULL);
             if (now - last_spotcheck >= SPOTCHECK_INTERVAL_SEC) {
-                fprintf(stderr, "Spot check triggered\n");
-                fprintf(stderr, "Current wheel positions: ");
+                fprintf(stderr, "### Spot check at ");
+                diag_time();
+                fprintf(stderr, " with %llu bytes / ", outcount);
+                print_human_size(outcount);
+                fprintf(stderr, "\npositions are: ");
                 for (w = 0; w < num_wheels; w++)
                     fprintf(stderr, "%02x ", positions[w]);
-                fprintf(stderr, "\nbigwheelpos looks like: 0x%04x\n", bigwheelpos);
+                fprintf(stderr, "and bigwheelpos looks like: 0x%04x\n", bigwheelpos);
+                fflush(stderr);
                 last_spotcheck = now;
             }
         }
@@ -243,18 +300,27 @@ int main(int argc, char *argv[])
     /* final flush */
     fflush(stdout);
 
-    fprintf(stderr, "Intake loops appear to be done.\n");
-    fprintf(stderr, "Final count appears to be %llu / 0x%llx\n",
-            outcount, outcount);
+    /* ---- final summary ---- */
+    fprintf(stderr, "#### Intake loops appear to be done at ");
+    diag_time();
+    fprintf(stderr, "\n");
+
     fprintf(stderr, "Wheel positions are: ");
     for (i = 0; i < num_wheels; i++)
         fprintf(stderr, "%02x ", positions[i]);
     fprintf(stderr, "\n");
-    fprintf(stderr, "bigwheel at position 0x%04x\n", bigwheelpos);
-    diag("Done.");
+
+    fprintf(stderr, "Time running: %.0f seconds.\n", difftime(time(NULL), start_time));
+    fprintf(stderr, "Total bytes: %llu / ", outcount);
+    print_human_size(outcount);
+    fprintf(stderr, "\n");
+
+    fprintf(stderr, "%s Start time.\n", ctime(&start_time));
+    fprintf(stderr, "Done.\nPeace, strength, and wisdom to you.\n");
 
     free(cassette);
     free(positions);
+    free(original_positions);
 
     return any_data ? 0 : 1;
 }
